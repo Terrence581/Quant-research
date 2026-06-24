@@ -49,7 +49,7 @@ DEFAULT_LOOKBACK_MONTHS = 3
 DEFAULT_HOLDING_MONTHS = 1
 DEFAULT_S = 0
 # 月频下回看窗口内要求的最少交易日数，用于剔除数据不完整的窗口。
-DEFAULT_MONTHLY_LOOKBACK_MIN_TRADING_DAYS = 100
+DEFAULT_MONTHLY_LOOKBACK_MIN_TRADING_DAYS = 21
 
 # 01-10 编号 CSV 输出开关。
 # 注意：若后续要运行 momentum_factor_diagnostics.py，至少需要保留 09、10 和主脚本自动输出的 12 号 IC 小表。
@@ -71,7 +71,7 @@ SAVE_LEGACY_COMPATIBILITY_CSV_OUTPUTS = False
 # 图1、图2需要的扫描区间只放在 momentum_factor_diagnostics.py 中使用。
 
 # A 股市场类型：1=上证A股，4=深证A股，16=创业板，32=科创板，64=北证A股。
-A_SHARE_MARKET_TYPES = {1, 4}
+A_SHARE_MARKET_TYPES = {1, 4, 16, 32, 64}
 
 # Trdsta 中带 ST、*ST、SST、S*ST、GST、G*ST、UST、U*ST、NST、N*ST 以及 PT 的状态。
 ST_OR_PT_STATUS_VALUES = {2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 16}
@@ -922,7 +922,7 @@ def calculate_raw_momentum(
     """计算横截面动量因子。
 
     日频：第 T 日收盘后使用同一股票 T-lookback_days 至 T-1 首尾收盘价收益率。
-    月频：仅在本月末交易日生成信号，使用 lookback_months 个月前月末收盘价到 T-s 月末收盘价的收益率。
+    月频：仅在本月末交易日生成信号，使用 lookback_months 个月前月末至 T-s 月末之间的日收益率复利。
     """
 
     data = normalize_date_columns(clean_data)
@@ -1017,7 +1017,7 @@ def _calculate_raw_momentum_monthly(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """月频动量：仅在本月末交易日生成信号。
 
-    动量窗口：lookback_months 个月前月末交易日收盘价到 T-s 月末交易日收盘价。
+    动量窗口：lookback_months 个月前月末交易日到 T-s 月末交易日之间的每日收益率复利。
     信号在 T 日收盘后生成，并用于 T+1 开盘，不引入未来数据。
     """
 
@@ -1092,11 +1092,17 @@ def _calculate_raw_momentum_monthly(
         how="left",
     )
 
-    # 回看窗口内交易日数量与涨跌停天数：基于每只股票完整日行情序列统计 (start, end]。
+    # 回看窗口内收益、交易日数量与涨跌停天数：基于每只股票完整日行情序列统计 (start, end]。
     signal_rows = signal_rows.reset_index(drop=True)
     signal_rows["_signal_row_id"] = np.arange(len(signal_rows), dtype="int64")
+    global_trade_dates = pd.to_datetime(
+        data["trade_date"].dropna().drop_duplicates().sort_values()
+    ).to_numpy(dtype="datetime64[ns]")
+    lookback_expected_counts = np.zeros(len(signal_rows), dtype="int64")
     lookback_valid_counts = np.zeros(len(signal_rows), dtype="int64")
     lookback_limit_counts = np.zeros(len(signal_rows), dtype="int64")
+    lookback_complete = np.zeros(len(signal_rows), dtype=bool)
+    lookback_compound_returns = np.full(len(signal_rows), np.nan)
     signal_specs_by_stock = {
         stock_code: stock_signals[["_signal_row_id", "momentum_start_date", "momentum_end_date"]].copy()
         for stock_code, stock_signals in signal_rows.groupby("stock_code", sort=False)
@@ -1108,6 +1114,7 @@ def _calculate_raw_momentum_monthly(
             continue
 
         trade_dates = pd.to_datetime(stock_history["trade_date"]).to_numpy(dtype="datetime64[ns]")
+        returns = stock_history[return_column].to_numpy(dtype="float64")
         limit_flags = (
             stock_history["limit_status"]
             .isin(LIMIT_UP_OR_DOWN_VALUES)
@@ -1123,33 +1130,40 @@ def _calculate_raw_momentum_monthly(
         for row_id, start_dt, end_dt in zip(row_ids, start_dates, end_dates):
             if np.isnat(start_dt) or np.isnat(end_dt):
                 continue
+            expected_left = int(np.searchsorted(global_trade_dates, start_dt, side="right"))
+            expected_right = int(np.searchsorted(global_trade_dates, end_dt, side="right"))
+            expected_days = expected_right - expected_left
+            if expected_days <= 0:
+                continue
+            lookback_expected_counts[row_id] = expected_days
+
             left_pos = int(np.searchsorted(trade_dates, start_dt, side="right"))
             right_pos = int(np.searchsorted(trade_dates, end_dt, side="right"))
             if right_pos <= left_pos:
                 continue
-            lookback_valid_counts[row_id] = right_pos - left_pos
+            window_dates = trade_dates[left_pos:right_pos]
+            window_returns = returns[left_pos:right_pos]
+            valid_days = int((~np.isnan(window_returns)).sum())
+            lookback_valid_counts[row_id] = valid_days
             lookback_limit_counts[row_id] = int(limit_prefix_sum[right_pos] - limit_prefix_sum[left_pos])
+            has_exact_end_record = len(window_dates) > 0 and window_dates[-1] == end_dt
+            if has_exact_end_record and valid_days == expected_days and len(window_returns) == expected_days:
+                lookback_compound_returns[row_id] = float(np.prod(1.0 + window_returns) - 1.0)
+                lookback_complete[row_id] = True
 
+    signal_rows["lookback_expected_days"] = lookback_expected_counts
     signal_rows["lookback_valid_days"] = lookback_valid_counts
     signal_rows["lookback_limit_days_count"] = lookback_limit_counts
+    signal_rows["has_complete_lookback_return"] = lookback_complete
+    signal_rows["lookback_expected_days"] = signal_rows["lookback_expected_days"].astype("Int64")
     signal_rows["lookback_valid_days"] = signal_rows["lookback_valid_days"].astype("Int64")
     signal_rows["lookback_limit_days_count"] = signal_rows["lookback_limit_days_count"].astype("Int64")
     signal_rows["lookback_has_limit_up_or_down"] = signal_rows["lookback_limit_days_count"].fillna(0).gt(0)
 
-    valid_price_mask = (
-        signal_rows["momentum_start_close_price"].notna()
-        & signal_rows["momentum_end_close_price"].notna()
-        & signal_rows["momentum_start_close_price"].gt(0)
-    )
-    signal_rows["momentum_raw"] = np.nan
-    signal_rows.loc[valid_price_mask, "momentum_raw"] = (
-        signal_rows.loc[valid_price_mask, "momentum_end_close_price"]
-        / signal_rows.loc[valid_price_mask, "momentum_start_close_price"]
-        - 1.0
-    )
+    signal_rows["momentum_raw"] = lookback_compound_returns
     invalid_window_mask = (
         signal_rows["lookback_valid_days"].fillna(0).lt(monthly_lookback_min_trading_days)
-        | ~valid_price_mask
+        | ~signal_rows["has_complete_lookback_return"].fillna(False).astype(bool)
     )
     signal_rows.loc[invalid_window_mask, "momentum_raw"] = np.nan
     signal_rows = signal_rows.drop(columns=["_signal_row_id"], errors="ignore")
@@ -1163,8 +1177,10 @@ def _calculate_raw_momentum_monthly(
         "momentum_end_date",
         "momentum_start_close_price",
         "momentum_end_close_price",
+        "lookback_expected_days",
         "lookback_valid_days",
         "lookback_limit_days_count",
+        "has_complete_lookback_return",
         "lookback_has_limit_up_or_down",
         "momentum_raw",
     ]
@@ -1206,6 +1222,10 @@ def _finalize_raw_momentum(
         "lookback_has_limit_up_or_down",
         "momentum_raw",
     ]
+    for optional_col in ["lookback_expected_days", "has_complete_lookback_return"]:
+        if optional_col in data.columns and optional_col not in base_columns:
+            insert_pos = base_columns.index("lookback_valid_days")
+            base_columns.insert(insert_pos, optional_col)
     raw_factor = data[base_columns].copy()
     raw_factor = raw_factor.rename(columns={"close_price": "signal_close_price"})
     raw_factor["lookback_days"] = lookback_days
@@ -2472,11 +2492,72 @@ def build_all_momentum_factor(raw_factor: pd.DataFrame, missing_factor: pd.DataF
     ).reset_index(drop=True)
 
 
+LONG_SHORT_MEMBER_COLUMNS = [
+    "trade_date",
+    "next_trade_date",
+    "holding_start_trade_date",
+    "holding_end_trade_date",
+    "portfolio_side",
+    "long_short_role",
+    "stock_code",
+    "quantile_group",
+    "standardized_momentum_rank_desc",
+    "cross_section_stock_count_after_zscore",
+    "momentum_raw",
+    "momentum_3sigma",
+    "momentum_zscore",
+    "signal_close_price",
+    "next_open_price",
+    "next_limit_up_price",
+    "next_limit_down_price",
+    "next_period_return_before_trade_filter",
+    "next_period_return",
+    "next_period_return_after_long_short_trade_filter",
+    "future_return_valid_days",
+    "has_complete_holding_return",
+    "is_next_open_one_word_limit_up",
+    "is_next_open_one_word_limit_down",
+    "is_next_open_one_word_limit",
+    "is_next_open_limit_up",
+    "is_next_open_limit_down",
+    "is_next_open_limit",
+    "is_tradable_next_open",
+    "is_long_short_trade_candidate",
+    "is_tradable_long_short_next_open",
+    "trade_filter_reason",
+    "rebalance_frequency",
+    "lookback_days",
+    "lookback_unit",
+    "s",
+    "monthly_skip_months",
+    "holding_days",
+    "holding_months",
+    "group_num",
+]
+
+
+def safe_nunique(data: pd.DataFrame, column: str) -> int:
+    """安全统计唯一值数量；空表或缺列返回 0，避免日志阶段中断主流程。"""
+
+    if column not in data.columns:
+        return 0
+    return int(data[column].nunique())
+
+
+def safe_masked_nunique(data: pd.DataFrame, mask: pd.Series, column: str) -> int:
+    """安全统计筛选后的唯一值数量；空表、缺列或空 mask 返回 0。"""
+
+    if column not in data.columns or data.empty:
+        return 0
+    aligned_mask = mask.reindex(data.index, fill_value=False).astype(bool)
+    return int(data.loc[aligned_mask, column].nunique())
+
+
 def build_long_short_stock_members(grouped_factor: pd.DataFrame, group_num: int) -> pd.DataFrame:
     """提取每日做多最高动量组和做空最低动量组的具体股票清单。"""
 
     if grouped_factor.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=LONG_SHORT_MEMBER_COLUMNS)
 
     member_data = grouped_factor.loc[
         grouped_factor["quantile_group"].isin([1, group_num])
@@ -2496,49 +2577,7 @@ def build_long_short_stock_members(grouped_factor: pd.DataFrame, group_num: int)
         default="other",
     )
 
-    ordered_columns = [
-        "trade_date",
-        "next_trade_date",
-        "holding_start_trade_date",
-        "holding_end_trade_date",
-        "portfolio_side",
-        "long_short_role",
-        "stock_code",
-        "quantile_group",
-        "standardized_momentum_rank_desc",
-        "cross_section_stock_count_after_zscore",
-        "momentum_raw",
-        "momentum_3sigma",
-        "momentum_zscore",
-        "signal_close_price",
-        "next_open_price",
-        "next_limit_up_price",
-        "next_limit_down_price",
-        "next_period_return_before_trade_filter",
-        "next_period_return",
-        "next_period_return_after_long_short_trade_filter",
-        "future_return_valid_days",
-        "has_complete_holding_return",
-        "is_next_open_one_word_limit_up",
-        "is_next_open_one_word_limit_down",
-        "is_next_open_one_word_limit",
-        "is_next_open_limit_up",
-        "is_next_open_limit_down",
-        "is_next_open_limit",
-        "is_tradable_next_open",
-        "is_long_short_trade_candidate",
-        "is_tradable_long_short_next_open",
-        "trade_filter_reason",
-        "rebalance_frequency",
-        "lookback_days",
-        "lookback_unit",
-        "s",
-        "monthly_skip_months",
-        "holding_days",
-        "holding_months",
-        "group_num",
-    ]
-    existing_columns = [col for col in ordered_columns if col in member_data.columns]
+    existing_columns = [col for col in LONG_SHORT_MEMBER_COLUMNS if col in member_data.columns]
     return member_data[existing_columns].sort_values(
         ["trade_date", "quantile_group", "standardized_momentum_rank_desc", "stock_code"],
         ascending=[True, True, True, True],
@@ -2821,38 +2860,38 @@ def main() -> None:
 
     factor_log = pd.DataFrame(
         [
-            ["sql_raw_market_data_loaded_from_cache_or_mysql", len(raw_tsv_data), raw_tsv_data["Stkcd"].nunique() if "Stkcd" in raw_tsv_data else None, raw_tsv_data["Trddt"].nunique() if "Trddt" in raw_tsv_data else None],
-            ["cleaned_stock_pool", len(clean_data), clean_data["stock_code"].nunique(), clean_data["trade_date"].nunique()],
-            ["all_momentum_factor_records", len(all_momentum_factor), all_momentum_factor["stock_code"].nunique(), all_momentum_factor["trade_date"].nunique()],
-            ["raw_momentum_valid", len(raw_factor), raw_factor["stock_code"].nunique(), raw_factor["trade_date"].nunique()],
-            ["raw_momentum_missing", len(missing_factor), missing_factor["stock_code"].nunique(), missing_factor["trade_date"].nunique()],
+            ["sql_raw_market_data_loaded_from_cache_or_mysql", len(raw_tsv_data), safe_nunique(raw_tsv_data, "Stkcd"), safe_nunique(raw_tsv_data, "Trddt")],
+            ["cleaned_stock_pool", len(clean_data), safe_nunique(clean_data, "stock_code"), safe_nunique(clean_data, "trade_date")],
+            ["all_momentum_factor_records", len(all_momentum_factor), safe_nunique(all_momentum_factor, "stock_code"), safe_nunique(all_momentum_factor, "trade_date")],
+            ["raw_momentum_valid", len(raw_factor), safe_nunique(raw_factor, "stock_code"), safe_nunique(raw_factor, "trade_date")],
+            ["raw_momentum_missing", len(missing_factor), safe_nunique(missing_factor, "stock_code"), safe_nunique(missing_factor, "trade_date")],
             [
                 "lookback_window_limit_marked_not_excluded",
                 int(lookback_limit_mask.sum()),
-                all_momentum_factor.loc[lookback_limit_mask, "stock_code"].nunique(),
-                all_momentum_factor.loc[lookback_limit_mask, "trade_date"].nunique(),
+                safe_masked_nunique(all_momentum_factor, lookback_limit_mask, "stock_code"),
+                safe_masked_nunique(all_momentum_factor, lookback_limit_mask, "trade_date"),
             ],
-            ["three_sigma_processed", len(factor_3sigma), factor_3sigma["stock_code"].nunique(), factor_3sigma["trade_date"].nunique()],
-            ["three_sigma_extreme_records", len(extreme_records), extreme_records["stock_code"].nunique(), extreme_records["trade_date"].nunique()],
-            ["zscore_standardized", len(factor_zscore), factor_zscore["stock_code"].nunique(), factor_zscore["trade_date"].nunique()],
-            ["standardized_momentum_ranked", len(ranked_factor), ranked_factor["stock_code"].nunique(), ranked_factor["trade_date"].nunique()],
-            ["quantile_grouped_factor", len(grouped_factor), grouped_factor["stock_code"].nunique(), grouped_factor["trade_date"].nunique()],
+            ["three_sigma_processed", len(factor_3sigma), safe_nunique(factor_3sigma, "stock_code"), safe_nunique(factor_3sigma, "trade_date")],
+            ["three_sigma_extreme_records", len(extreme_records), safe_nunique(extreme_records, "stock_code"), safe_nunique(extreme_records, "trade_date")],
+            ["zscore_standardized", len(factor_zscore), safe_nunique(factor_zscore, "stock_code"), safe_nunique(factor_zscore, "trade_date")],
+            ["standardized_momentum_ranked", len(ranked_factor), safe_nunique(ranked_factor, "stock_code"), safe_nunique(ranked_factor, "trade_date")],
+            ["quantile_grouped_factor", len(grouped_factor), safe_nunique(grouped_factor, "stock_code"), safe_nunique(grouped_factor, "trade_date")],
             [
                 "next_open_limit_excluded",
                 int(next_open_limit_mask.sum()),
-                grouped_factor.loc[next_open_limit_mask, "stock_code"].nunique(),
-                grouped_factor.loc[next_open_limit_mask, "trade_date"].nunique(),
+                safe_masked_nunique(grouped_factor, next_open_limit_mask, "stock_code"),
+                safe_masked_nunique(grouped_factor, next_open_limit_mask, "trade_date"),
             ],
-            ["quantile_equal_weight_returns", len(quantile_returns), quantile_returns["quantile_group"].nunique(), quantile_returns["trade_date"].nunique()],
-            ["long_short_group_stock_members", len(long_short_members), long_short_members["stock_code"].nunique(), long_short_members["trade_date"].nunique()],
-            ["long_short_returns", len(long_short_returns), None, long_short_returns["trade_date"].nunique()],
-            ["ic_series", len(ic_series), None, ic_series["trade_date"].nunique() if "trade_date" in ic_series else None],
-            ["ic_summary", len(ic_summary), ic_summary["metric"].nunique() if "metric" in ic_summary else None, None],
-            ["factor_value_statistics", len(factor_value_statistics), factor_value_statistics["factor_column"].nunique() if "factor_column" in factor_value_statistics else None, None],
+            ["quantile_equal_weight_returns", len(quantile_returns), safe_nunique(quantile_returns, "quantile_group"), safe_nunique(quantile_returns, "trade_date")],
+            ["long_short_group_stock_members", len(long_short_members), safe_nunique(long_short_members, "stock_code"), safe_nunique(long_short_members, "trade_date")],
+            ["long_short_returns", len(long_short_returns), None, safe_nunique(long_short_returns, "trade_date")],
+            ["ic_series", len(ic_series), None, safe_nunique(ic_series, "trade_date")],
+            ["ic_summary", len(ic_summary), safe_nunique(ic_summary, "metric"), None],
+            ["factor_value_statistics", len(factor_value_statistics), safe_nunique(factor_value_statistics, "factor_column"), None],
             ["factor_input_summary", len(factor_input_summary), None, None],
-            ["performance_summary", len(performance_summary), performance_summary["portfolio"].nunique(), None],
-            ["drawdown_series", len(drawdown_series), drawdown_series["portfolio"].nunique(), drawdown_series["trade_date"].nunique()],
-            ["yearly_performance", len(yearly_performance), yearly_performance["portfolio"].nunique(), None],
+            ["performance_summary", len(performance_summary), safe_nunique(performance_summary, "portfolio"), None],
+            ["drawdown_series", len(drawdown_series), safe_nunique(drawdown_series, "portfolio"), safe_nunique(drawdown_series, "trade_date")],
+            ["yearly_performance", len(yearly_performance), safe_nunique(yearly_performance, "portfolio"), None],
         ],
         columns=["step", "rows", "entity_count", "trade_date_count"],
     )
@@ -2948,7 +2987,7 @@ def main() -> None:
     print(f"调仓频率：{args.rebalance_frequency}；回看：{lookback_label}；持有：{holding_label}")
     print(f"保留 Markettype：{selected_market_types_text}")
     print(f"流通市值下限 Dsmvosd：{args.min_float_market_value:,.0f}（约 {args.min_float_market_value * 1000.0:,.0f} 元）")
-    print(f"清洗后股票池记录数：{len(clean_data):,}")
+    print(f"清洗后股票池记录数：{len(clean_data):,}")  
     print(f"有效动量因子记录数：{len(raw_factor):,}")
     print(f"3sigma 极端值记录数：{len(extreme_records):,}")
     print(f"最终 Z-score 因子记录数：{len(factor_zscore):,}")

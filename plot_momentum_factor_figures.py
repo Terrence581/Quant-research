@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import math
 import re
 from dataclasses import dataclass
@@ -16,8 +17,18 @@ import pandas as pd
 # ============================================================
 
 PROJECT_DIR = Path(__file__).resolve().parent
+MAIN_SCRIPT_PATH = PROJECT_DIR / "calculate_momentum_factor_sql.py"
 DEFAULT_OUTPUT_ROOT = PROJECT_DIR / "output"
 DEFAULT_PLOT_OUTPUT_DIR = DEFAULT_OUTPUT_ROOT / "momentum_factor_figures"
+MAIN_DEFAULTS_FALLBACK = {
+    "DEFAULT_REBALANCE_FREQUENCY": "daily",
+    "DEFAULT_LOOKBACK_DAYS": 50,
+    "DEFAULT_HOLDING_DAYS": 5,
+    "DEFAULT_LOOKBACK_MONTHS": 3,
+    "DEFAULT_HOLDING_MONTHS": 1,
+    "DEFAULT_S": 0,
+    "DEFAULT_GROUP_NUM": 10,
+}
 
 LEGACY_EXPERIMENT_DIR_RE = re.compile(
     r"^lb(?P<lookback>\d+)_hd(?P<holding>\d+)_g(?P<group>\d+)_mkt(?P<market>.+)$"
@@ -39,6 +50,9 @@ FACTOR_FILE_CANDIDATES = [
 QUANTILE_RETURN_FILE_CANDIDATES = [
     "09_quantile_equal_weight_returns.csv",
     "momentum_quantile_equal_weight_returns.csv",
+]
+QUANTILE_RETURN_SUMMARY_FILE_CANDIDATES = [
+    "13_momentum_quantile_return_summary.csv",
 ]
 IC_SUMMARY_FILE_CANDIDATES = [
     "12_momentum_ic_ir_summary.csv",
@@ -71,12 +85,73 @@ class MetricResult:
     observation_count: int | None = None
 
 
+def load_main_script_defaults() -> dict[str, object]:
+    """Read DEFAULT_* constants from the main script without importing or executing it."""
+
+    defaults = MAIN_DEFAULTS_FALLBACK.copy()
+    if not MAIN_SCRIPT_PATH.exists():
+        return defaults
+
+    for encoding in ("utf-8", "utf-8-sig", "gbk"):
+        try:
+            source = MAIN_SCRIPT_PATH.read_text(encoding=encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        return defaults
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return defaults
+
+    wanted = set(defaults)
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id in wanted:
+                try:
+                    defaults[target.id] = ast.literal_eval(node.value)
+                except Exception:
+                    pass
+    return defaults
+
+
+def main_default_rebalance_frequency(defaults: dict[str, object]) -> str:
+    value = str(defaults.get("DEFAULT_REBALANCE_FREQUENCY", "daily")).lower()
+    return value if value in {"daily", "monthly"} else "daily"
+
+
+def resolve_auto_frequency(requested_frequency: str, defaults: dict[str, object]) -> str:
+    requested = str(requested_frequency).lower()
+    if requested != "auto":
+        return requested
+    return main_default_rebalance_frequency(defaults)
+
+
+def resolve_figure_frequency(figure_frequency: str, global_frequency: str) -> str:
+    requested = str(figure_frequency).lower()
+    if requested != "auto":
+        return requested
+    return str(global_frequency).lower()
+
+
 # ============================================================
 # 2. 参数和通用工具
 # ============================================================
 
 
 def parse_args() -> argparse.Namespace:
+    main_defaults = load_main_script_defaults()
+    default_group_num = int(main_defaults.get("DEFAULT_GROUP_NUM", 10))
+    default_lookback_days = int(main_defaults.get("DEFAULT_LOOKBACK_DAYS", 50))
+    default_holding_days = int(main_defaults.get("DEFAULT_HOLDING_DAYS", 5))
+    default_lookback_months = int(main_defaults.get("DEFAULT_LOOKBACK_MONTHS", 3))
+    default_holding_months = int(main_defaults.get("DEFAULT_HOLDING_MONTHS", 1))
+    default_s = int(main_defaults.get("DEFAULT_S", 0))
+
     parser = argparse.ArgumentParser(
         description=(
             "基于 calculate_momentum_factor_sql.py 的输出目录绘制动量因子参数图和分组绩效表。"
@@ -86,7 +161,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT, help="主脚本 output 根目录。")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_PLOT_OUTPUT_DIR, help="PNG 和汇总 CSV 输出目录。")
     parser.add_argument("--market-tag", default=None, help="可选市场标签过滤，例如 1-4-16-32-64。")
-    parser.add_argument("--group-num", type=int, default=10, help="图1/图2使用的分组数，默认 10。")
+    parser.add_argument(
+        "--rebalance-frequency",
+        choices=["auto", "daily", "monthly"],
+        default="auto",
+        help="全局画图频率；auto 时跟随 calculate_momentum_factor_sql.py 的 DEFAULT_REBALANCE_FREQUENCY。",
+    )
+    parser.add_argument("--group-num", type=int, default=default_group_num, help="图1/图2使用的分组数，默认跟随主脚本。")
     parser.add_argument("--lookback-days", default="20,40,60", help="图1横轴 lookback days，逗号分隔。")
     parser.add_argument(
         "--figure1-experiments",
@@ -94,23 +175,35 @@ def parse_args() -> argparse.Namespace:
         help="图1横轴实验标签，逗号分隔；支持 lb40_hd20 或 40:20 写法。",
     )
     parser.add_argument("--holding-days", default="1,5,10", help="图2横轴 holding days，逗号分隔。")
-    parser.add_argument("--fixed-holding-days", type=int, default=5, help="图1固定 holding days，默认 5。")
-    parser.add_argument("--fixed-lookback-days", type=int, default=40, help="图2固定 lookback days，默认 40。")
-    parser.add_argument("--figure3-lookback-days", type=int, default=40, help="图3使用的 lookback days，默认 40。")
-    parser.add_argument("--figure3-holding-days", type=int, default=5, help="图3使用的 holding days，默认 5。")
-    parser.add_argument("--figure3-group-num", type=int, default=10, help="图3分组数量，默认 10。")
+    parser.add_argument("--holding-months", default="1,2,3,4,5", help="图2月频横轴 holding months，逗号分隔。")
+    parser.add_argument("--fixed-holding-days", type=int, default=default_holding_days, help="图1固定 holding days，默认跟随主脚本。")
+    parser.add_argument("--fixed-lookback-days", type=int, default=default_lookback_days, help="图2固定 lookback days，默认跟随主脚本。")
+    parser.add_argument("--fixed-lookback-months", type=int, default=default_lookback_months, help="图2月频固定 lookback months，默认跟随主脚本。")
+    parser.add_argument("--figure2-s", type=int, default=default_s, help="图2月频 skip 月数，默认跟随主脚本。")
+    parser.add_argument("--figure3-lookback-days", type=int, default=default_lookback_days, help="图3日频实验 lookback days，默认跟随主脚本。")
+    parser.add_argument("--figure3-holding-days", type=int, default=default_holding_days, help="图3日频实验 holding days，默认跟随主脚本。")
+    parser.add_argument("--figure3-group-num", type=int, default=default_group_num, help="图3分组数量，默认跟随主脚本。")
+    parser.add_argument(
+        "--figure3-rebalance-frequency",
+        choices=["auto", "daily", "monthly"],
+        default="auto",
+        help="图3选择的实验频率；auto 时跟随 --rebalance-frequency。",
+    )
+    parser.add_argument("--figure3-lookback-months", type=int, default=default_lookback_months, help="图3月频实验 lookback months，默认跟随主脚本。")
+    parser.add_argument("--figure3-holding-months", type=int, default=default_holding_months, help="图3月频实验 holding months，默认跟随主脚本。")
+    parser.add_argument("--figure3-s", type=int, default=default_s, help="图3月频实验 skip 月数，默认跟随主脚本。")
     parser.add_argument(
         "--figure4-rebalance-frequency",
         choices=["auto", "daily", "monthly"],
         default="auto",
-        help="图4分组绩效表选择的实验频率。auto 会优先使用月频 lb6m_s1_hd1m，缺失时使用日频图3参数。",
+        help="图4分组绩效表选择的实验频率；auto 时跟随 --rebalance-frequency。",
     )
     parser.add_argument("--figure4-lookback-days", type=int, default=None, help="图4日频实验 lookback days；默认沿用图3。")
     parser.add_argument("--figure4-holding-days", type=int, default=None, help="图4日频实验 holding days；默认沿用图3。")
-    parser.add_argument("--figure4-lookback-months", type=int, default=6, help="图4月频实验 lookback months，默认 6。")
-    parser.add_argument("--figure4-holding-months", type=int, default=1, help="图4月频实验 holding months，默认 1。")
-    parser.add_argument("--figure4-s", type=int, default=1, help="图4月频实验 skip 月数，默认 1。")
-    parser.add_argument("--figure4-group-num", type=int, default=10, help="图4分组数量，默认 10。")
+    parser.add_argument("--figure4-lookback-months", type=int, default=default_lookback_months, help="图4月频实验 lookback months，默认跟随主脚本。")
+    parser.add_argument("--figure4-holding-months", type=int, default=default_holding_months, help="图4月频实验 holding months，默认跟随主脚本。")
+    parser.add_argument("--figure4-s", type=int, default=default_s, help="图4月频实验 skip 月数，默认跟随主脚本。")
+    parser.add_argument("--figure4-group-num", type=int, default=default_group_num, help="图4分组数量，默认跟随主脚本。")
     parser.add_argument(
         "--figure4-overlap-mode",
         choices=["non-overlap", "all"],
@@ -453,6 +546,89 @@ def compute_group_final_returns(
     return pd.DataFrame(rows, columns=columns), "ok", path
 
 
+def read_group_final_nav(
+    experiment: ExperimentInfo | None,
+    group_num: int,
+) -> tuple[pd.DataFrame, str, Path | None]:
+    columns = ["quantile_group", "label", "final_nav", "status", "source_file"]
+    if experiment is None:
+        return pd.DataFrame(
+            [
+                {
+                    "quantile_group": group_id,
+                    "label": f"group{group_id}",
+                    "final_nav": math.nan,
+                    "status": "missing_experiment_dir",
+                    "source_file": "",
+                }
+                for group_id in range(1, group_num + 1)
+            ],
+            columns=columns,
+        ), "missing_experiment_dir", None
+
+    path = find_input_file(experiment.path, QUANTILE_RETURN_SUMMARY_FILE_CANDIDATES)
+    if path is None:
+        return pd.DataFrame(
+            [
+                {
+                    "quantile_group": group_id,
+                    "label": f"group{group_id}",
+                    "final_nav": math.nan,
+                    "status": "missing_quantile_return_summary_13",
+                    "source_file": "",
+                }
+                for group_id in range(1, group_num + 1)
+            ],
+            columns=columns,
+        ), "missing_quantile_return_summary_13", None
+
+    data = pd.read_csv(path)
+    required_columns = ["quantile_group", "final_nav"]
+    if any(col not in data.columns for col in required_columns):
+        return pd.DataFrame(
+            [
+                {
+                    "quantile_group": group_id,
+                    "label": f"group{group_id}",
+                    "final_nav": math.nan,
+                    "status": "missing_required_nav_summary_columns",
+                    "source_file": str(path),
+                }
+                for group_id in range(1, group_num + 1)
+            ],
+            columns=columns,
+        ), "missing_required_nav_summary_columns", path
+
+    data["quantile_group"] = pd.to_numeric(data["quantile_group"], errors="coerce")
+    data["final_nav"] = pd.to_numeric(data["final_nav"], errors="coerce")
+    label_values = data["label"].astype(str) if "label" in data.columns else pd.Series([""] * len(data))
+    data = data.assign(label=label_values)
+    data = data.dropna(subset=["quantile_group"]).copy()
+
+    rows: list[dict] = []
+    for group_id in range(1, group_num + 1):
+        matched = data.loc[data["quantile_group"].eq(group_id)]
+        if matched.empty:
+            final_nav = math.nan
+            label = f"group{group_id}"
+            status = "missing_group_nav"
+        else:
+            final_nav = float(matched["final_nav"].iloc[0])
+            raw_label = str(matched["label"].iloc[0])
+            label = raw_label if raw_label and raw_label.lower() != "nan" else f"group{group_id}"
+            status = "read_quantile_return_summary_13"
+        rows.append(
+            {
+                "quantile_group": group_id,
+                "label": label,
+                "final_nav": final_nav,
+                "status": status,
+                "source_file": str(path),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns), "ok", path
+
+
 def first_non_null_value(data: pd.DataFrame, column: str, default: object = None) -> object:
     if column not in data.columns:
         return default
@@ -713,31 +889,49 @@ def plot_figure1(data: pd.DataFrame, output_path: Path, dpi: int) -> None:
     plt.close(fig)
 
 
-def plot_figure2(data: pd.DataFrame, output_path: Path, fixed_lookback_days: int, metric: str, dpi: int) -> None:
+def plot_figure2(
+    data: pd.DataFrame,
+    output_path: Path,
+    frequency: str,
+    fixed_lookback_days: int,
+    fixed_lookback_months: int,
+    s: int,
+    metric: str,
+    dpi: int,
+) -> None:
     metric_label = "IC Mean" if metric == "ic_mean" else "RankIC Mean"
-    title = f"Lookback Days = {fixed_lookback_days}"
+    if frequency == "monthly":
+        title = f"Lookback Months = {fixed_lookback_months}, s = {s}"
+        x_column = "holding_months"
+        x_label = "Holding Months"
+    else:
+        title = f"Lookback Days = {fixed_lookback_days}"
+        x_column = "holding_days"
+        x_label = "Holding Days"
+
     if not data["value"].notna().any():
         plot_empty_figure(title, output_path, f"没有找到可用 {metric_label} 数据", dpi)
         return
 
     fig, ax = plt.subplots(figsize=(9.5, 5.4), dpi=dpi)
-    ax.bar(data["holding_days"].astype(str), data["value"], color="#579c87", width=0.58)
+    plot_data = data.sort_values(x_column).copy()
+    ax.bar(plot_data[x_column].astype(str), plot_data["value"], color="#579c87", width=0.58)
     ax.set_title(title, fontsize=14, pad=14)
-    ax.set_xlabel("Holding Days")
+    ax.set_xlabel(x_label)
     ax.set_ylabel(f"因子有效期（{metric_label}）")
     ax.axhline(0.0, color="#666666", linewidth=0.8)
     ax.grid(axis="y", alpha=0.24)
-    annotate_bars(ax, data["value"], percent=False)
+    annotate_bars(ax, plot_data["value"], percent=False)
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
 
 
-def plot_figure3(data: pd.DataFrame, output_path: Path, return_mode: str, holding_days: int, dpi: int) -> None:
+def plot_figure3(data: pd.DataFrame, output_path: Path, return_mode: str, holding_label: str, dpi: int) -> None:
     if return_mode == "mean-holding":
-        y_label = f"最终收益率（holding days = {holding_days}）"
+        y_label = f"最终收益率（{holding_label}）"
     elif return_mode == "last-holding":
-        y_label = f"最终收益率（“holding days = {holding_days}”，最后截面）"
+        y_label = f"最终收益率（{holding_label}，最后截面）"
     else:
         y_label = "最终累计收益率（跨期复利）"
     title = "各分组最终收益率"
@@ -760,6 +954,32 @@ def plot_figure3(data: pd.DataFrame, output_path: Path, return_mode: str, holdin
     plt.close(fig)
 
 
+def plot_figure5_final_nav(data: pd.DataFrame, output_path: Path, dpi: int) -> None:
+    title = "各分组最终NAV"
+    if data.empty or not data["final_nav"].notna().any():
+        plot_empty_figure(title, output_path, "没有找到可用最终NAV数据", dpi)
+        return
+
+    plot_data = data.sort_values("quantile_group").copy()
+    plot_data["plot_label"] = plot_data["quantile_group"].apply(lambda value: f"G{int(value)}")
+
+    fig, ax = plt.subplots(figsize=(10.5, 5.6), dpi=dpi)
+    colors = [
+        "#b95050" if group_id == 1 else "#3c76a6" if group_id == len(plot_data) else "#8096a8"
+        for group_id in plot_data["quantile_group"]
+    ]
+    ax.bar(plot_data["plot_label"], plot_data["final_nav"], color=colors, width=0.62)
+    ax.set_title(title, fontsize=14, pad=14)
+    ax.set_xlabel("分组数")
+    ax.set_ylabel("最终NAV")
+    ax.axhline(1.0, color="#666666", linewidth=0.9, linestyle="--")
+    ax.grid(axis="y", alpha=0.24)
+    annotate_bars(ax, plot_data["final_nav"], percent=False)
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+
+
 def format_percent_value(value: object) -> str:
     numeric_value = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
     if pd.isna(numeric_value):
@@ -774,8 +994,32 @@ def format_float_value(value: object, digits: int = 3) -> str:
     return f"{float(numeric_value):.{digits}f}"
 
 
-def plot_figure4_group_performance_table(data: pd.DataFrame, output_path: Path, dpi: int) -> None:
-    title = "Group1 至 Group10 分组绩效"
+def build_experiment_subtitle(experiment: ExperimentInfo | None, frequency: str, group_num: int) -> str:
+    if experiment is not None and experiment.rebalance_frequency == "monthly":
+        return (
+            f"频率: monthly | lookback={experiment.lookback_months}m | "
+            f"s={experiment.s or 0} | holding={experiment.holding_months}m | "
+            f"group={experiment.group_num} | market={experiment.market_tag}"
+        )
+    if experiment is not None and experiment.rebalance_frequency == "daily":
+        return (
+            f"频率: daily | lookback={experiment.lookback_days}d | "
+            f"holding={experiment.holding_days}d | group={experiment.group_num} | "
+            f"market={experiment.market_tag}"
+        )
+    return f"频率: {frequency} | group={group_num}"
+
+
+def plot_figure4_group_performance_table(
+    data: pd.DataFrame,
+    output_path: Path,
+    dpi: int,
+    group_num: int,
+    subtitle: str = "",
+) -> None:
+    observed_group_num = pd.to_numeric(data.get("quantile_group", pd.Series(dtype="float64")), errors="coerce").max()
+    group_num = int(observed_group_num) if pd.notna(observed_group_num) else int(group_num)
+    title = f"Group1 至 Group{group_num} 分组绩效"
     metric_columns = [
         "annual_return_net",
         "annual_volatility",
@@ -802,10 +1046,21 @@ def plot_figure4_group_performance_table(data: pd.DataFrame, output_path: Path, 
         )
 
     headers = ["分组", "年化收益", "年化波动", "夏普比率", "最大回撤", "胜率"]
-    fig_height = max(4.4, 0.40 * (len(cell_rows) + 2))
+    fig_height = max(4.8 if subtitle else 4.4, 0.40 * (len(cell_rows) + 2) + (0.3 if subtitle else 0.0))
     fig, ax = plt.subplots(figsize=(11.5, fig_height), dpi=dpi)
     ax.axis("off")
-    ax.set_title(title, fontsize=15, fontweight="bold", pad=4)
+    ax.set_title(title, fontsize=15, fontweight="bold", pad=10 if subtitle else 4)
+    if subtitle:
+        ax.text(
+            0.5,
+            0.955,
+            subtitle,
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=9.5,
+            color="#4f5963",
+        )
 
     table = ax.table(
         cellText=cell_rows,
@@ -814,7 +1069,7 @@ def plot_figure4_group_performance_table(data: pd.DataFrame, output_path: Path, 
         colLoc="left",
         loc="upper center",
         colWidths=[0.23, 0.19, 0.15, 0.15, 0.15, 0.13],
-        bbox=[0.0, 0.01, 1.0, 0.94],
+        bbox=[0.0, 0.01, 1.0, 0.89 if subtitle else 0.94],
     )
     table.auto_set_font_size(False)
     table.set_fontsize(10.5)
@@ -940,21 +1195,97 @@ def build_holding_scan_rows(
     return pd.DataFrame(rows)
 
 
+def build_monthly_holding_scan_rows(
+    experiments: list[ExperimentInfo],
+    fixed_lookback_months: int,
+    holding_months_values: list[int],
+    s: int,
+    group_num: int,
+    market_tag: str | None,
+    metric: str,
+    figure_name: str,
+) -> pd.DataFrame:
+    rows: list[dict] = []
+    for holding_months in holding_months_values:
+        experiment = select_monthly_experiment(
+            experiments,
+            lookback_months=fixed_lookback_months,
+            holding_months=holding_months,
+            s=s,
+            group_num=group_num,
+            market_tag=market_tag,
+        )
+        result = get_ic_metric(experiment, metric)
+        rows.append(
+            {
+                "figure": figure_name,
+                "rebalance_frequency": "monthly",
+                "lookback_days": pd.NA,
+                "lookback_months": fixed_lookback_months,
+                "s": s,
+                "holding_days": pd.NA,
+                "holding_months": holding_months,
+                "group_num": group_num,
+                "market_tag": market_tag or (experiment.market_tag if experiment else ""),
+                "metric": metric,
+                "value": result.value,
+                "observation_count": result.observation_count,
+                "status": result.status,
+                "experiment_dir": str(experiment.path) if experiment else "",
+                "source_file": str(result.source_file) if result.source_file else "",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def fail_if_missing(strict: bool, summary: pd.DataFrame) -> None:
     if not strict:
         return
     bad = summary.loc[summary["value"].isna()]
     if bad.empty:
         return
-    detail = bad[["figure", "lookback_days", "holding_days", "group_num", "status", "experiment_dir"]].to_string(index=False)
+    columns = [
+        col
+        for col in ["figure", "lookback_days", "lookback_months", "holding_days", "holding_months", "group_num", "status", "experiment_dir"]
+        if col in bad.columns
+    ]
+    detail = bad[columns].to_string(index=False)
     raise SystemExit(f"存在缺失或不可用数据：\n{detail}")
 
 
-def select_figure4_experiment(args: argparse.Namespace, experiments: list[ExperimentInfo]) -> ExperimentInfo | None:
+def select_figure3_experiment(
+    args: argparse.Namespace,
+    experiments: list[ExperimentInfo],
+    frequency: str,
+) -> ExperimentInfo | None:
+    if frequency == "monthly":
+        return select_monthly_experiment(
+            experiments,
+            lookback_months=args.figure3_lookback_months,
+            holding_months=args.figure3_holding_months,
+            s=args.figure3_s,
+            group_num=args.figure3_group_num,
+            market_tag=args.market_tag,
+        )
+
+    return select_experiment(
+        experiments,
+        lookback_days=args.figure3_lookback_days,
+        holding_days=args.figure3_holding_days,
+        group_num=args.figure3_group_num,
+        market_tag=args.market_tag,
+    )
+
+
+def select_figure4_experiment(
+    args: argparse.Namespace,
+    experiments: list[ExperimentInfo],
+    frequency: str,
+) -> ExperimentInfo | None:
     figure4_lookback_days = args.figure4_lookback_days or args.figure3_lookback_days
     figure4_holding_days = args.figure4_holding_days or args.figure3_holding_days
 
-    if args.figure4_rebalance_frequency == "monthly":
+    if frequency == "monthly":
         return select_monthly_experiment(
             experiments,
             lookback_months=args.figure4_lookback_months,
@@ -963,26 +1294,6 @@ def select_figure4_experiment(args: argparse.Namespace, experiments: list[Experi
             group_num=args.figure4_group_num,
             market_tag=args.market_tag,
         )
-
-    if args.figure4_rebalance_frequency == "daily":
-        return select_experiment(
-            experiments,
-            lookback_days=figure4_lookback_days,
-            holding_days=figure4_holding_days,
-            group_num=args.figure4_group_num,
-            market_tag=args.market_tag,
-        )
-
-    monthly_experiment = select_monthly_experiment(
-        experiments,
-        lookback_months=args.figure4_lookback_months,
-        holding_months=args.figure4_holding_months,
-        s=args.figure4_s,
-        group_num=args.figure4_group_num,
-        market_tag=args.market_tag,
-    )
-    if monthly_experiment is not None:
-        return monthly_experiment
 
     return select_experiment(
         experiments,
@@ -995,10 +1306,15 @@ def select_figure4_experiment(args: argparse.Namespace, experiments: list[Experi
 
 def main() -> None:
     args = parse_args()
+    main_defaults = load_main_script_defaults()
+    global_frequency = resolve_auto_frequency(args.rebalance_frequency, main_defaults)
+    figure3_frequency = resolve_figure_frequency(args.figure3_rebalance_frequency, global_frequency)
+    figure4_frequency = resolve_figure_frequency(args.figure4_rebalance_frequency, global_frequency)
     set_chinese_font()
 
     figure1_experiment_specs = parse_figure1_experiments(args.figure1_experiments)
     holding_days_values = parse_int_list(args.holding_days)
+    holding_months_values = parse_int_list(args.holding_months)
     experiments = discover_experiments(args.output_root)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1010,22 +1326,33 @@ def main() -> None:
         metric="ic_mean",
         figure_name="figure1_ic_mean_by_experiment",
     )
-    fig2_data = build_holding_scan_rows(
-        experiments=experiments,
-        fixed_lookback_days=args.fixed_lookback_days,
-        holding_days_values=holding_days_values,
-        group_num=args.group_num,
-        market_tag=args.market_tag,
-        metric=args.validity_metric,
-        figure_name="figure2_factor_validity_by_holding",
-    )
+    if global_frequency == "monthly":
+        fig2_data = build_monthly_holding_scan_rows(
+            experiments=experiments,
+            fixed_lookback_months=args.fixed_lookback_months,
+            holding_months_values=holding_months_values,
+            s=args.figure2_s,
+            group_num=args.group_num,
+            market_tag=args.market_tag,
+            metric=args.validity_metric,
+            figure_name="figure2_factor_validity_by_holding",
+        )
+    else:
+        fig2_data = build_holding_scan_rows(
+            experiments=experiments,
+            fixed_lookback_days=args.fixed_lookback_days,
+            holding_days_values=holding_days_values,
+            group_num=args.group_num,
+            market_tag=args.market_tag,
+            metric=args.validity_metric,
+            figure_name="figure2_factor_validity_by_holding",
+        )
 
-    figure3_experiment = select_experiment(
-        experiments,
-        args.figure3_lookback_days,
-        args.figure3_holding_days,
-        args.figure3_group_num,
-        args.market_tag,
+    figure3_experiment = select_figure3_experiment(args, experiments, figure3_frequency)
+    figure3_holding_label = (
+        f"holding months = {args.figure3_holding_months}"
+        if figure3_frequency == "monthly"
+        else f"holding days = {args.figure3_holding_days}"
     )
     fig3_data, fig3_status, fig3_source = compute_group_final_returns(
         figure3_experiment,
@@ -1034,8 +1361,12 @@ def main() -> None:
     )
     fig3_summary = fig3_data.assign(
         figure="figure3_final_return_by_group",
+        rebalance_frequency=figure3_frequency,
         lookback_days=args.figure3_lookback_days,
+        lookback_months=args.figure3_lookback_months,
+        s=args.figure3_s,
         holding_days=args.figure3_holding_days,
+        holding_months=args.figure3_holding_months,
         group_num=args.figure3_group_num,
         market_tag=args.market_tag or (figure3_experiment.market_tag if figure3_experiment else ""),
         metric=args.figure3_return_mode,
@@ -1046,8 +1377,12 @@ def main() -> None:
     )[
         [
             "figure",
+            "rebalance_frequency",
             "lookback_days",
+            "lookback_months",
+            "s",
             "holding_days",
+            "holding_months",
             "group_num",
             "market_tag",
             "metric",
@@ -1063,7 +1398,50 @@ def main() -> None:
     if fig3_status != "ok":
         fig3_summary["status"] = fig3_status
 
-    figure4_experiment = select_figure4_experiment(args, experiments)
+    fig5_data, fig5_status, fig5_source = read_group_final_nav(
+        figure3_experiment,
+        group_num=args.figure3_group_num,
+    )
+    fig5_summary = fig5_data.assign(
+        figure="figure5_final_nav_by_group",
+        rebalance_frequency=figure3_frequency,
+        lookback_days=args.figure3_lookback_days,
+        lookback_months=args.figure3_lookback_months,
+        s=args.figure3_s,
+        holding_days=args.figure3_holding_days,
+        holding_months=args.figure3_holding_months,
+        group_num=args.figure3_group_num,
+        market_tag=args.market_tag or (figure3_experiment.market_tag if figure3_experiment else ""),
+        metric="final_nav",
+        value=fig5_data["final_nav"],
+        observation_count=pd.NA,
+        experiment_dir=str(figure3_experiment.path) if figure3_experiment else "",
+        source_file=str(fig5_source) if fig5_source else "",
+    )[
+        [
+            "figure",
+            "rebalance_frequency",
+            "lookback_days",
+            "lookback_months",
+            "s",
+            "holding_days",
+            "holding_months",
+            "group_num",
+            "market_tag",
+            "metric",
+            "quantile_group",
+            "label",
+            "value",
+            "observation_count",
+            "status",
+            "experiment_dir",
+            "source_file",
+        ]
+    ]
+    if fig5_status != "ok":
+        fig5_summary["status"] = fig5_status
+
+    figure4_experiment = select_figure4_experiment(args, experiments, figure4_frequency)
     fig4_data, fig4_status, fig4_source = compute_group_performance_table(
         figure4_experiment,
         group_num=args.figure4_group_num,
@@ -1076,6 +1454,7 @@ def main() -> None:
     fig2_path = args.output_dir / "figure2_factor_validity_by_holding.png"
     fig3_path = args.output_dir / "figure3_final_return_by_group.png"
     fig4_path = args.output_dir / "figure4_group_performance_table.png"
+    fig5_path = args.output_dir / "figure5_final_nav_by_group.png"
     fig4_summary_path = args.output_dir / "figure4_group_performance_summary.csv"
     summary_path = args.output_dir / "momentum_factor_figure_metrics.csv"
 
@@ -1084,6 +1463,7 @@ def main() -> None:
             fig1_data.assign(quantile_group=pd.NA),
             fig2_data.assign(quantile_group=pd.NA, label=pd.NA),
             fig3_summary,
+            fig5_summary,
         ],
         ignore_index=True,
         sort=False,
@@ -1093,15 +1473,36 @@ def main() -> None:
     write_csv(fig4_data, fig4_summary_path)
 
     plot_figure1(fig1_data, fig1_path, dpi=args.dpi)
-    plot_figure2(fig2_data, fig2_path, fixed_lookback_days=args.fixed_lookback_days, metric=args.validity_metric, dpi=args.dpi)
+    plot_figure2(
+        fig2_data,
+        fig2_path,
+        frequency=global_frequency,
+        fixed_lookback_days=args.fixed_lookback_days,
+        fixed_lookback_months=args.fixed_lookback_months,
+        s=args.figure2_s,
+        metric=args.validity_metric,
+        dpi=args.dpi,
+    )
     plot_figure3(
         fig3_data,
         fig3_path,
         return_mode=args.figure3_return_mode,
-        holding_days=args.figure3_holding_days,
+        holding_label=figure3_holding_label,
         dpi=args.dpi,
     )
-    plot_figure4_group_performance_table(fig4_data, fig4_path, dpi=args.dpi)
+    plot_figure5_final_nav(fig5_data, fig5_path, dpi=args.dpi)
+    figure4_subtitle = build_experiment_subtitle(
+        figure4_experiment,
+        frequency=figure4_frequency,
+        group_num=args.figure4_group_num,
+    )
+    plot_figure4_group_performance_table(
+        fig4_data,
+        fig4_path,
+        dpi=args.dpi,
+        group_num=args.figure4_group_num,
+        subtitle=figure4_subtitle,
+    )
 
     print("画图完成。")
     print(f"指标汇总：{summary_path}")
@@ -1110,7 +1511,13 @@ def main() -> None:
     print(f"{fig2_path}")
     print(f"{fig3_path}")
     print(f"{fig4_path}")
-    missing = summary.loc[summary["value"].isna(), ["figure", "lookback_days", "holding_days", "group_num", "status"]]
+    print(f"{fig5_path}")
+    missing_columns = [
+        col
+        for col in ["figure", "lookback_days", "lookback_months", "holding_days", "holding_months", "group_num", "status"]
+        if col in summary.columns
+    ]
+    missing = summary.loc[summary["value"].isna(), missing_columns]
     if not missing.empty:
         print("提示：以下组合缺少可用数据，图片中对应位置会留空：")
         print(missing.to_string(index=False))

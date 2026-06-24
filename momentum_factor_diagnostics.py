@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import math
 import re
 from pathlib import Path
 
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import pandas as pd
 
@@ -14,8 +16,28 @@ import pandas as pd
 # ============================================================
 
 PROJECT_DIR = Path(__file__).resolve().parent
+MAIN_SCRIPT_PATH = PROJECT_DIR / "calculate_momentum_factor_sql.py"
 DEFAULT_OUTPUT_ROOT = PROJECT_DIR / "output"
 TRADING_DAYS_PER_YEAR = 252
+MONTHS_PER_YEAR = 12
+MAIN_DEFAULTS_FALLBACK = {
+    "DEFAULT_REBALANCE_FREQUENCY": "daily",
+    "DEFAULT_LOOKBACK_DAYS": 50,
+    "DEFAULT_HOLDING_DAYS": 5,
+    "DEFAULT_LOOKBACK_MONTHS": 3,
+    "DEFAULT_HOLDING_MONTHS": 1,
+    "DEFAULT_S": 0,
+    "DEFAULT_GROUP_NUM": 10,
+}
+LEGACY_EXPERIMENT_DIR_RE = re.compile(
+    r"^lb(?P<lookback>\d+)_hd(?P<holding>\d+)_g(?P<group>\d+)_mkt(?P<market>.+)$"
+)
+DAILY_EXPERIMENT_DIR_RE = re.compile(
+    r"^daily_lb(?P<lookback>\d+)_hd(?P<holding>\d+)_g(?P<group>\d+)_mkt(?P<market>.+)$"
+)
+MONTHLY_EXPERIMENT_DIR_RE = re.compile(
+    r"^monthly_lb(?P<lookback_months>\d+)m_s(?P<s>\d+)_hd(?P<holding_months>\d+)m_g(?P<group>\d+)_mkt(?P<market>.+)$"
+)
 RETURN_COLUMN_TAGS = {
     "return_without_dividend": "retnd",
     "return_with_dividend": "retwd",
@@ -56,6 +78,30 @@ def parse_args() -> argparse.Namespace:
         help="动量因子回看交易日数；默认从 input-dir/run_summary.csv 或因子文件自动识别。",
     )
     parser.add_argument(
+        "--rebalance-frequency",
+        choices=["auto", "daily", "monthly"],
+        default="auto",
+        help="调仓频率；auto 时跟随 calculate_momentum_factor_sql.py 的 DEFAULT_REBALANCE_FREQUENCY。",
+    )
+    parser.add_argument(
+        "--lookback-months",
+        type=int,
+        default=None,
+        help="月频回看月数；默认跟随主脚本或 input-dir/run_summary.csv。",
+    )
+    parser.add_argument(
+        "--holding-months",
+        type=int,
+        default=None,
+        help="月频持有月数；默认跟随主脚本或 input-dir/run_summary.csv。",
+    )
+    parser.add_argument(
+        "--s",
+        type=int,
+        default=None,
+        help="月频动量跳过的最近月数；默认跟随主脚本或 input-dir/run_summary.csv。",
+    )
+    parser.add_argument(
         "--holding-days",
         type=int,
         default=None,
@@ -78,6 +124,103 @@ def parse_args() -> argparse.Namespace:
         help="自定义输出文件标签；不填则自动使用 lb{回看天数}_hd{持有天数}_g{分组数}_mkt{市场类型}。",
     )
     return parser.parse_args()
+
+
+def load_main_script_defaults() -> dict[str, object]:
+    """Read DEFAULT_* constants from the main script without importing or executing it."""
+
+    defaults = MAIN_DEFAULTS_FALLBACK.copy()
+    if not MAIN_SCRIPT_PATH.exists():
+        return defaults
+
+    for encoding in ("utf-8", "utf-8-sig", "gbk"):
+        try:
+            source = MAIN_SCRIPT_PATH.read_text(encoding=encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        return defaults
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return defaults
+
+    wanted = set(defaults)
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id in wanted:
+                try:
+                    defaults[target.id] = ast.literal_eval(node.value)
+                except Exception:
+                    pass
+    return defaults
+
+
+def to_int_or_default(value: object, default: int) -> int:
+    if value is None or pd.isna(value):
+        return int(default)
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "na", "<na>"}:
+        return int(default)
+    return int(float(text))
+
+
+def parse_experiment_dir_name(path: Path) -> dict[str, object] | None:
+    daily_match = DAILY_EXPERIMENT_DIR_RE.match(path.name)
+    if daily_match:
+        return {
+            "rebalance_frequency": "daily",
+            "lookback_days": int(daily_match.group("lookback")),
+            "holding_days": int(daily_match.group("holding")),
+            "group_num": int(daily_match.group("group")),
+            "market_tag": daily_match.group("market"),
+        }
+
+    monthly_match = MONTHLY_EXPERIMENT_DIR_RE.match(path.name)
+    if monthly_match:
+        return {
+            "rebalance_frequency": "monthly",
+            "lookback_months": int(monthly_match.group("lookback_months")),
+            "s": int(monthly_match.group("s")),
+            "holding_months": int(monthly_match.group("holding_months")),
+            "group_num": int(monthly_match.group("group")),
+            "market_tag": monthly_match.group("market"),
+        }
+
+    legacy_match = LEGACY_EXPERIMENT_DIR_RE.match(path.name)
+    if legacy_match:
+        return {
+            "rebalance_frequency": "daily",
+            "lookback_days": int(legacy_match.group("lookback")),
+            "holding_days": int(legacy_match.group("holding")),
+            "group_num": int(legacy_match.group("group")),
+            "market_tag": legacy_match.group("market"),
+            "legacy_directory": True,
+        }
+
+    return None
+
+
+def experiment_matches_main_defaults(info: dict[str, object], defaults: dict[str, object]) -> bool:
+    frequency = str(defaults.get("DEFAULT_REBALANCE_FREQUENCY", "daily")).lower()
+    if info.get("rebalance_frequency") != frequency:
+        return False
+    if frequency == "monthly":
+        return (
+            info.get("lookback_months") == int(defaults.get("DEFAULT_LOOKBACK_MONTHS", 3))
+            and info.get("holding_months") == int(defaults.get("DEFAULT_HOLDING_MONTHS", 1))
+            and info.get("s") == int(defaults.get("DEFAULT_S", 0))
+            and info.get("group_num") == int(defaults.get("DEFAULT_GROUP_NUM", 10))
+        )
+    return (
+        info.get("lookback_days") == int(defaults.get("DEFAULT_LOOKBACK_DAYS", 50))
+        and info.get("holding_days") == int(defaults.get("DEFAULT_HOLDING_DAYS", 5))
+        and info.get("group_num") == int(defaults.get("DEFAULT_GROUP_NUM", 10))
+    )
 
 
 def ensure_file_exists(path: Path) -> None:
@@ -132,6 +275,21 @@ def set_chinese_font() -> None:
             plt.rcParams["font.sans-serif"] = [font_name]
             break
     plt.rcParams["axes.unicode_minus"] = False
+
+
+def set_yearly_xaxis(ax: plt.Axes, dates: pd.Series) -> None:
+    """Set one x-axis major tick for every calendar year covered by dates."""
+
+    clean_dates = pd.to_datetime(dates, errors="coerce").dropna()
+    if clean_dates.empty:
+        return
+
+    start_year = int(clean_dates.min().year)
+    end_year = int(clean_dates.max().year)
+    ax.set_xlim(pd.Timestamp(start_year, 1, 1), pd.Timestamp(end_year, 12, 31))
+    ax.xaxis.set_major_locator(mdates.YearLocator(base=1))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax.tick_params(axis="x", labelrotation=0)
 
 
 def two_sided_t_pvalue(t_value: float, degrees_of_freedom: int) -> float:
@@ -254,10 +412,16 @@ def build_experiment_folder_name(
     holding_days: object,
     group_num: object,
     market_types_tag: str,
+    rebalance_frequency: str = "daily",
+    lookback_months: object | None = None,
+    holding_months: object | None = None,
+    s: object | None = None,
 ) -> str:
     """生成本次实验文件夹名：lb{回看}_hd{持有}_g{分组}_mkt{市场类型}。"""
 
-    return f"lb{lookback_days}_hd{holding_days}_g{group_num}_mkt{market_types_tag}"
+    if str(rebalance_frequency).lower() == "monthly":
+        return f"monthly_lb{lookback_months}m_s{s}_hd{holding_months}m_g{group_num}_mkt{market_types_tag}"
+    return f"daily_lb{lookback_days}_hd{holding_days}_g{group_num}_mkt{market_types_tag}"
 
 
 def resolve_experiment_output_dir(base_output_dir: Path, experiment_folder_name: str) -> Path:
@@ -304,17 +468,29 @@ def find_latest_experiment_dir(output_root: Path) -> Path:
     if not output_root.exists():
         raise SystemExit(f"输出根目录不存在：{output_root}")
 
-    candidates = [
-        path
-        for path in output_root.iterdir()
-        if path.is_dir() and path.name.startswith("lb") and "_hd" in path.name and "_g" in path.name and "_mkt" in path.name
-        and has_calculation_outputs(path)
-    ]
+    main_defaults = load_main_script_defaults()
+    target_frequency = str(main_defaults.get("DEFAULT_REBALANCE_FREQUENCY", "daily")).lower()
+    candidates = []
+    for path in output_root.iterdir():
+        if not path.is_dir() or not has_calculation_outputs(path):
+            continue
+        info = parse_experiment_dir_name(path)
+        if info is None:
+            continue
+        candidates.append((path, info))
     if not candidates:
         raise SystemExit(
             f"没有在 {output_root} 下找到包含主计算结果的 lb*_hd*_g*_mkt* 实验文件夹。"
         )
-    return max(candidates, key=lambda path: (path.stat().st_mtime, path.name))
+    preferred = [path for path, info in candidates if experiment_matches_main_defaults(info, main_defaults)]
+    if preferred:
+        return max(preferred, key=lambda path: (path.stat().st_mtime, path.name))
+
+    same_frequency = [path for path, info in candidates if info.get("rebalance_frequency") == target_frequency]
+    if same_frequency:
+        return max(same_frequency, key=lambda path: (path.stat().st_mtime, path.name))
+
+    return max((path for path, _ in candidates), key=lambda path: (path.stat().st_mtime, path.name))
 
 
 def resolve_input_dir(input_dir: Path) -> Path:
@@ -361,23 +537,57 @@ def infer_research_params(
 ) -> dict[str, object]:
     """从命令行参数、上游 run_summary 和数据列中推断本次诊断对应的研究参数。"""
 
+    main_defaults = load_main_script_defaults()
     upstream_summary = load_upstream_run_summary(input_dir)
+    requested_frequency = str(getattr(args, "rebalance_frequency", "auto")).lower()
+    if requested_frequency != "auto":
+        rebalance_frequency = requested_frequency
+    else:
+        rebalance_frequency = str(
+            upstream_summary.get("rebalance_frequency")
+            or main_defaults.get("DEFAULT_REBALANCE_FREQUENCY", "daily")
+        ).lower()
 
     lookback_days = (
         args.lookback_days
         or upstream_summary.get("lookback_days")
-        or first_valid_value(factor_data.get("lookback_days", pd.Series(dtype="float64")), "na")
+        or main_defaults.get("DEFAULT_LOOKBACK_DAYS")
+        or first_valid_value(factor_data.get("lookback_days", pd.Series(dtype="float64")), 50)
+    )
+    lookback_months = (
+        getattr(args, "lookback_months", None)
+        or upstream_summary.get("lookback_months")
+        or main_defaults.get("DEFAULT_LOOKBACK_MONTHS")
+        or first_valid_value(factor_data.get("lookback_days", pd.Series(dtype="float64")), 3)
+    )
+    monthly_skip_months = (
+        getattr(args, "s", None)
+        if getattr(args, "s", None) is not None
+        else upstream_summary.get("s")
+        or upstream_summary.get("monthly_skip_months")
+        or main_defaults.get("DEFAULT_S")
+        or first_valid_value(factor_data.get("monthly_skip_months", pd.Series(dtype="float64")), 0)
     )
     holding_days = (
         args.holding_days
         or upstream_summary.get("holding_days")
+        or main_defaults.get("DEFAULT_HOLDING_DAYS")
         or first_valid_value(long_short_returns.get("holding_days", pd.Series(dtype="float64")), None)
         or first_valid_value(quantile_returns.get("holding_days", pd.Series(dtype="float64")), None)
         or first_valid_value(factor_data.get("holding_days", pd.Series(dtype="float64")), 1)
     )
+    holding_months = (
+        getattr(args, "holding_months", None)
+        or upstream_summary.get("holding_months")
+        or main_defaults.get("DEFAULT_HOLDING_MONTHS")
+        or first_valid_value(long_short_returns.get("holding_months", pd.Series(dtype="float64")), None)
+        or first_valid_value(quantile_returns.get("holding_months", pd.Series(dtype="float64")), None)
+        or first_valid_value(factor_data.get("holding_months", pd.Series(dtype="float64")), 1)
+    )
     group_num = (
         args.group_num
         or upstream_summary.get("group_num")
+        or main_defaults.get("DEFAULT_GROUP_NUM")
         or first_valid_value(factor_data.get("group_num", pd.Series(dtype="float64")), None)
         or quantile_returns["quantile_group"].dropna().max()
     )
@@ -393,9 +603,12 @@ def infer_research_params(
         or "na"
     )
 
-    lookback_days = int(float(lookback_days)) if str(lookback_days) != "na" else "na"
-    holding_days = int(float(holding_days)) if str(holding_days) != "na" else "na"
-    group_num = int(float(group_num)) if str(group_num) != "na" else "na"
+    lookback_days = to_int_or_default(lookback_days, int(main_defaults.get("DEFAULT_LOOKBACK_DAYS", 50)))
+    holding_days = to_int_or_default(holding_days, int(main_defaults.get("DEFAULT_HOLDING_DAYS", 5)))
+    lookback_months = to_int_or_default(lookback_months, int(main_defaults.get("DEFAULT_LOOKBACK_MONTHS", 3)))
+    holding_months = to_int_or_default(holding_months, int(main_defaults.get("DEFAULT_HOLDING_MONTHS", 1)))
+    monthly_skip_months = to_int_or_default(monthly_skip_months, int(main_defaults.get("DEFAULT_S", 0)))
+    group_num = to_int_or_default(group_num, int(main_defaults.get("DEFAULT_GROUP_NUM", 10)))
     return_column = str(return_column)
     return_column_tag = RETURN_COLUMN_TAGS.get(return_column, sanitize_filename_part(return_column))
     market_types_tag = normalize_market_types_tag(market_types_value)
@@ -404,13 +617,22 @@ def infer_research_params(
         holding_days=holding_days,
         group_num=group_num,
         market_types_tag=market_types_tag,
+        rebalance_frequency=rebalance_frequency,
+        lookback_months=lookback_months,
+        holding_months=holding_months,
+        s=monthly_skip_months,
     )
 
     output_tag = args.output_tag or experiment_folder_name
 
     return {
+        "rebalance_frequency": rebalance_frequency,
         "lookback_days": lookback_days,
+        "lookback_months": lookback_months,
+        "s": monthly_skip_months,
+        "monthly_skip_months": monthly_skip_months,
         "holding_days": holding_days,
+        "holding_months": holding_months,
         "group_num": group_num,
         "return_column": return_column,
         "return_column_tag": return_column_tag,
@@ -450,6 +672,8 @@ def load_quantile_returns(input_dir: Path) -> pd.DataFrame:
         "group_avg_momentum_zscore",
         "group_avg_momentum_raw",
         "holding_days",
+        "holding_months",
+        "monthly_skip_months",
     ]:
         if col in data.columns:
             data[col] = pd.to_numeric(data[col], errors="coerce")
@@ -505,6 +729,8 @@ def load_long_short_returns(input_dir: Path) -> pd.DataFrame:
         "short_bottom_group_one_word_limit_excluded_count",
         "short_bottom_group_missing_next_record_count",
         "holding_days",
+        "holding_months",
+        "monthly_skip_months",
     ]:
         if col in data.columns:
             data[col] = pd.to_numeric(data[col], errors="coerce")
@@ -560,11 +786,16 @@ def load_factor_for_ic(input_dir: Path) -> pd.DataFrame:
         "momentum_3sigma",
         "momentum_zscore",
         "lookback_days",
+        "lookback_unit",
         "holding_days",
+        "holding_months",
         "lookback_valid_days",
         "lookback_limit_days_count",
         "lookback_has_limit_up_or_down",
         "return_column_used",
+        "rebalance_frequency",
+        "s",
+        "monthly_skip_months",
         "next_period_return",
         "next_period_return_before_trade_filter",
         "next_period_return_after_long_short_trade_filter",
@@ -589,6 +820,8 @@ def load_factor_for_ic(input_dir: Path) -> pd.DataFrame:
         usecols=usecols,
         dtype={
             "stock_code": "string",
+            "lookback_unit": "string",
+            "rebalance_frequency": "string",
             "return_column_used": "string",
             "next_period_return_column_used": "string",
             "trade_filter_reason": "string",
@@ -609,6 +842,9 @@ def load_factor_for_ic(input_dir: Path) -> pd.DataFrame:
         "next_period_return_after_long_short_trade_filter",
         "lookback_days",
         "holding_days",
+        "holding_months",
+        "s",
+        "monthly_skip_months",
         "lookback_valid_days",
         "lookback_limit_days_count",
         "quantile_group",
@@ -619,6 +855,12 @@ def load_factor_for_ic(input_dir: Path) -> pd.DataFrame:
     for col in ["holding_days"]:
         if col not in data.columns:
             data[col] = 1
+    if "holding_months" not in data.columns:
+        data["holding_months"] = pd.NA
+    if "monthly_skip_months" not in data.columns:
+        data["monthly_skip_months"] = pd.NA
+    if "rebalance_frequency" not in data.columns:
+        data["rebalance_frequency"] = pd.NA
     if "next_trade_date" not in data.columns:
         data["next_trade_date"] = pd.NaT
     if "trade_filter_reason" not in data.columns:
@@ -977,6 +1219,7 @@ def plot_daily_ic_curve(ic_series: pd.DataFrame, output_path: Path) -> None:
     ax.set_ylabel("IC")
     ax.legend()
     ax.grid(alpha=0.22)
+    set_yearly_xaxis(ax, plot_data["trade_date"])
     fig.autofmt_xdate()
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight")
@@ -1018,6 +1261,7 @@ def plot_cumulative_ic_curve(ic_series: pd.DataFrame, output_path: Path) -> None
     ax.set_ylabel("累计 IC")
     ax.legend()
     ax.grid(alpha=0.22)
+    set_yearly_xaxis(ax, plot_data["trade_date"])
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
@@ -1088,6 +1332,21 @@ def summarize_factor_input(factor_data: pd.DataFrame) -> pd.DataFrame:
         if "holding_days" in factor_data.columns
         else []
     )
+    holding_months_values = (
+        factor_data["holding_months"].dropna().astype(int).astype(str).unique().tolist()
+        if "holding_months" in factor_data.columns
+        else []
+    )
+    monthly_skip_months_values = (
+        factor_data["monthly_skip_months"].dropna().astype(int).astype(str).unique().tolist()
+        if "monthly_skip_months" in factor_data.columns
+        else []
+    )
+    rebalance_frequency_values = (
+        factor_data["rebalance_frequency"].dropna().astype(str).unique().tolist()
+        if "rebalance_frequency" in factor_data.columns
+        else []
+    )
     group_num_values = (
         factor_data["group_num"].dropna().astype(int).astype(str).unique().tolist()
         if "group_num" in factor_data.columns
@@ -1118,6 +1377,9 @@ def summarize_factor_input(factor_data: pd.DataFrame) -> pd.DataFrame:
         ["next_trade_date_end", factor_data["next_trade_date"].max() if "next_trade_date" in factor_data.columns else pd.NaT],
         ["lookback_days", ",".join(lookback_days_values)],
         ["holding_days", ",".join(holding_days_values)],
+        ["rebalance_frequency", ",".join(rebalance_frequency_values)],
+        ["monthly_skip_months", ",".join(monthly_skip_months_values)],
+        ["holding_months", ",".join(holding_months_values)],
         ["group_num", ",".join(group_num_values)],
         ["factor_return_column_used", ",".join(factor_return_column_values)],
         ["next_period_return_column_used", ",".join(next_return_column_values)],
@@ -1134,6 +1396,8 @@ def build_quantile_nav(
     quantile_returns: pd.DataFrame,
     group_num: int | None = None,
     holding_days: int = 1,
+    rebalance_frequency: str = "daily",
+    holding_months: int | None = None,
 ) -> pd.DataFrame:
     """整理各分组收益率，并用非重叠持有期收益计算各组 NAV 曲线。"""
 
@@ -1148,7 +1412,8 @@ def build_quantile_nav(
 
     # group_equal_weight_return 是未来 holding_days 日收益率；若逐日 cumprod，会把重叠持有期收益重复复利。
     # 这里按 holding_days 间隔抽取非重叠调仓点，只用于展示更合理的分组 NAV 曲线。
-    non_overlapping_return_wide = return_wide.iloc[::max(int(holding_days), 1)].copy()
+    sample_step = max(int(holding_months or 1), 1) if rebalance_frequency == "monthly" else max(int(holding_days), 1)
+    non_overlapping_return_wide = return_wide.iloc[::sample_step].copy()
     nav_wide = (1.0 + non_overlapping_return_wide).cumprod()
     nav_wide.columns = [f"{col}_NAV" for col in nav_wide.columns]
 
@@ -1244,52 +1509,67 @@ def plot_quantile_return_curves(quantile_nav: pd.DataFrame, output_path: Path, g
     plt.ylabel("NAV")
     plt.legend(ncol=2, fontsize=8)
     plt.grid(alpha=0.22)
+    set_yearly_xaxis(plt.gca(), plot_data["trade_date"])
     plt.tight_layout()
     plt.savefig(output_path, bbox_inches="tight")
     plt.close()
 
 
 def plot_long_short_nav(long_short_returns: pd.DataFrame, output_path: Path) -> None:
-    """绘制多空价差组合原始 NAV 走势和日度收益。"""
+    """绘制多空价差组合原始 NAV 走势。"""
 
     plot_data = long_short_returns.sort_values("trade_date").copy()
-    bar_colors = plot_data["long_short_spread_return"].map(
-        lambda value: "#d62728" if value >= 0 else "#1f77b4"
+    if plot_data.empty:
+        return
+
+    if "holding_end_trade_date_max" in plot_data.columns:
+        plot_data["nav_plot_date"] = pd.to_datetime(plot_data["holding_end_trade_date_max"], errors="coerce")
+    elif "holding_end_trade_date_min" in plot_data.columns:
+        plot_data["nav_plot_date"] = pd.to_datetime(plot_data["holding_end_trade_date_min"], errors="coerce")
+    else:
+        plot_data["nav_plot_date"] = pd.to_datetime(plot_data["trade_date"], errors="coerce")
+
+    plot_data = plot_data.dropna(subset=["nav_plot_date", "long_short_spread_nav"]).sort_values("nav_plot_date")
+    if plot_data.empty:
+        return
+
+    first_row = plot_data.iloc[0]
+    if "holding_start_trade_date_min" in plot_data.columns and pd.notna(first_row.get("holding_start_trade_date_min")):
+        initial_date = pd.to_datetime(first_row["holding_start_trade_date_min"], errors="coerce")
+    else:
+        initial_date = pd.to_datetime(first_row["nav_plot_date"], errors="coerce")
+    if pd.isna(initial_date) or initial_date > first_row["nav_plot_date"]:
+        initial_date = first_row["nav_plot_date"]
+
+    nav_plot = pd.concat(
+        [
+            pd.DataFrame(
+                {
+                    "nav_plot_date": [initial_date],
+                    "long_short_spread_nav": [1.0],
+                }
+            ),
+            plot_data[["nav_plot_date", "long_short_spread_nav"]],
+        ],
+        ignore_index=True,
     )
 
-    fig, (nav_ax, return_ax) = plt.subplots(
-        2,
-        1,
-        figsize=(13, 7.8),
-        dpi=170,
-        sharex=True,
-        gridspec_kw={"height_ratios": [2.5, 1.0]},
-    )
+    fig, nav_ax = plt.subplots(figsize=(13, 5.4), dpi=170)
 
     nav_ax.plot(
-        plot_data["trade_date"],
-        plot_data["long_short_spread_nav"],
+        nav_plot["nav_plot_date"],
+        nav_plot["long_short_spread_nav"],
         linewidth=1.15,
         color="#1f77b4",
         label="High-Low NAV",
     )
     nav_ax.axhline(1.0, color="#666666", linestyle="--", linewidth=0.8)
     nav_ax.set_title("动量因子多空价差组合净值走势")
+    nav_ax.set_xlabel("时间")
     nav_ax.set_ylabel("NAV")
     nav_ax.legend()
     nav_ax.grid(alpha=0.22)
-
-    return_ax.bar(
-        plot_data["trade_date"],
-        plot_data["long_short_spread_return"] * 100.0,
-        width=1.0,
-        color=bar_colors,
-        alpha=0.72,
-    )
-    return_ax.axhline(0.0, color="#333333", linewidth=0.7)
-    return_ax.set_xlabel("时间")
-    return_ax.set_ylabel("日收益率（%）")
-    return_ax.grid(alpha=0.18)
+    set_yearly_xaxis(nav_ax, nav_plot["nav_plot_date"])
 
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight")
@@ -1300,13 +1580,18 @@ def plot_long_short_volatility(
     long_short_returns: pd.DataFrame,
     output_path: Path,
     holding_days: int,
+    rebalance_frequency: str = "daily",
+    holding_months: int | None = None,
     windows: tuple = (10, 20, 60),
 ) -> None:
     """绘制多空价差组合日收益率的滚动年化波动率。"""
 
     plot_data = long_short_returns.sort_values("trade_date").copy()
     spread_return = pd.to_numeric(plot_data["long_short_spread_return"], errors="coerce")
-    annualization_periods_per_year = TRADING_DAYS_PER_YEAR / holding_days
+    if rebalance_frequency == "monthly":
+        annualization_periods_per_year = MONTHS_PER_YEAR / max(int(holding_months or 1), 1)
+    else:
+        annualization_periods_per_year = TRADING_DAYS_PER_YEAR / max(int(holding_days), 1)
 
     plt.figure(figsize=(13, 5.5), dpi=170)
 
@@ -1336,6 +1621,7 @@ def plot_long_short_volatility(
     plt.ylabel("年化波动率（%）")
     plt.legend()
     plt.grid(alpha=0.22)
+    set_yearly_xaxis(plt.gca(), plot_data["trade_date"])
     plt.tight_layout()
     plt.savefig(output_path, bbox_inches="tight")
     plt.close()
@@ -1371,8 +1657,10 @@ def main() -> None:
         factor_data=factor_data,
     )
     output_tag = research_params["output_tag"]
+    rebalance_frequency = str(research_params["rebalance_frequency"])
     group_num = int(research_params["group_num"])
     holding_days = int(research_params["holding_days"])
+    holding_months = int(research_params["holding_months"])
     experiment_folder_name = str(research_params["experiment_folder_name"])
     output_dir: Path = (
         input_dir
@@ -1418,7 +1706,13 @@ def main() -> None:
     plot_cumulative_ic_curve(ic_series, cumulative_ic_png)
 
     print("5/6 正在整理分组收益率、NAV 数据并绘图...")
-    quantile_nav = build_quantile_nav(quantile_returns, group_num=group_num, holding_days=holding_days)
+    quantile_nav = build_quantile_nav(
+        quantile_returns,
+        group_num=group_num,
+        holding_days=holding_days,
+        rebalance_frequency=rebalance_frequency,
+        holding_months=holding_months,
+    )
     quantile_return_summary = summarize_quantile_returns(quantile_returns, quantile_nav)
     long_short_return_summary = summarize_long_short_returns(long_short_returns)
     quantile_returns_csv = numbered_path(output_dir, 13, "momentum_quantile_returns_for_diagnostics", ".csv")
@@ -1438,6 +1732,8 @@ def main() -> None:
         long_short_returns,
         long_short_volatility_png,
         holding_days=holding_days,
+        rebalance_frequency=rebalance_frequency,
+        holding_months=holding_months,
     )
 
     print("6/6 正在输出运行汇总...")
@@ -1447,8 +1743,13 @@ def main() -> None:
             ["output_dir", str(output_dir)],
             ["output_tag", output_tag],
             ["experiment_folder_name", experiment_folder_name],
+            ["rebalance_frequency", research_params["rebalance_frequency"]],
             ["lookback_days", research_params["lookback_days"]],
+            ["lookback_months", research_params["lookback_months"]],
+            ["s", research_params["s"]],
+            ["monthly_skip_months", research_params["monthly_skip_months"]],
             ["holding_days", research_params["holding_days"]],
+            ["holding_months", research_params["holding_months"]],
             ["group_num", research_params["group_num"]],
             ["selected_market_types", research_params["selected_market_types"]],
             ["market_types_tag", research_params["market_types_tag"]],
