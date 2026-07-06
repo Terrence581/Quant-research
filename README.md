@@ -2,6 +2,8 @@
 
 本项目用于研究 A 股截面动量因子，覆盖从行情数据读取、样本清洗、因子计算、分层组合、未来收益、IC 检验、多空价差组合到图表诊断的完整流程。
 
+动量因子相关代码已统一放在 `截面动量因子/` 文件夹中。
+
 当前框架支持两类调仓频率：
 
 - 日频：按交易日回看和持有。
@@ -22,15 +24,16 @@
 
 ```text
 .
-├── calculate_momentum_factor_sql.py        # 主计算脚本
-├── momentum_factor_diagnostics.py          # 诊断图表脚本
-├── plot_momentum_factor_figures.py         # 报告图表汇总脚本
-└── README.md
+├── README.md
+└── 截面动量因子/
+    ├── calculate_momentum_factor_sql.py        # 主计算脚本
+    ├── momentum_factor_diagnostics.py          # 诊断图表脚本
+    └── plot_momentum_factor_figures.py         # 报告图表汇总脚本
 ```
 
 ### 1.1 主计算脚本
 
-`calculate_momentum_factor_sql.py`
+`截面动量因子/calculate_momentum_factor_sql.py`
 
 负责完整回测主流程：
 
@@ -48,7 +51,7 @@
 
 ### 1.2 诊断脚本
 
-`momentum_factor_diagnostics.py`
+`截面动量因子/momentum_factor_diagnostics.py`
 
 负责读取主脚本输出结果，生成诊断表和图：
 
@@ -62,7 +65,7 @@
 
 ### 1.3 报告图表脚本
 
-`plot_momentum_factor_figures.py`
+`截面动量因子/plot_momentum_factor_figures.py`
 
 用于生成报告需要的汇总图表，例如：
 
@@ -207,6 +210,13 @@ matplotlib
 ### 5.2 运行主计算脚本
 
 ```bash
+python 截面动量因子/calculate_momentum_factor_sql.py
+```
+
+也可以先进入文件夹再运行：
+
+```bash
+cd 截面动量因子
 python calculate_momentum_factor_sql.py
 ```
 
@@ -215,15 +225,15 @@ python calculate_momentum_factor_sql.py
 ### 5.3 运行诊断脚本
 
 ```bash
-python momentum_factor_diagnostics.py
+python 截面动量因子/momentum_factor_diagnostics.py
 ```
 
-诊断脚本会读取主脚本默认参数，并自动匹配 `output/` 下最新的对应实验目录。
+诊断脚本会读取主脚本默认参数，并自动匹配 `截面动量因子/output/` 下最新的对应实验目录。
 
 ### 5.4 运行报告图表脚本
 
 ```bash
-python plot_momentum_factor_figures.py
+python 截面动量因子/plot_momentum_factor_figures.py
 ```
 
 ---
@@ -233,7 +243,7 @@ python plot_momentum_factor_figures.py
 输出结果默认保存在：
 
 ```text
-output/
+截面动量因子/output/
 ```
 
 ### 6.1 日频输出目录
