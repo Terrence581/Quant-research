@@ -25,10 +25,14 @@
 ```text
 .
 ├── README.md
-└── 截面动量因子/
-    ├── calculate_momentum_factor_sql.py        # 主计算脚本
-    ├── momentum_factor_diagnostics.py          # 诊断图表脚本
-    └── plot_momentum_factor_figures.py         # 报告图表汇总脚本
+├── 截面动量因子/
+│   ├── calculate_momentum_factor_sql.py        # 主计算脚本
+│   ├── momentum_factor_diagnostics.py          # 诊断图表脚本
+│   └── plot_momentum_factor_figures.py         # 报告图表汇总脚本
+└── strong_momentum_LongOnly/
+    ├── factor1_LongOnly.py                     # 强势股回调 long-only 主策略脚本
+    ├── factor1_LongOnly_diagnostics.py         # long-only 策略诊断脚本
+    └── README.md                               # 策略说明
 ```
 
 ### 1.1 主计算脚本
@@ -73,6 +77,19 @@
 - 不同 holding 参数下的因子有效期。
 - Group1 至 Group10 最终收益或最终 NAV 柱状图。
 - Group1 至 Group10 绩效表。
+
+### 1.4 强势股回调 Long-only 策略
+
+`strong_momentum_LongOnly/`
+
+该文件夹包含强势股回调事件型 long-only 策略：
+
+1. 使用五条路径筛选强动量回调信号。
+2. 在 `T+1` 开盘检查可交易性并买入。
+3. 使用 `Dretwd` 累乘计算未来持有期收益。
+4. 输出 long-only 每日 NAV、交易过滤诊断、IC/RankIC 和指定交易日买入明细。
+
+使用方法和输出说明见 `strong_momentum_LongOnly/README.md`。
 
 ---
 
